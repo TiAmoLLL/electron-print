@@ -1,0 +1,119 @@
+const ChildProcess = require('node:child_process')
+const Path = require('node:path')
+const FileSystem = require('node:fs')
+const process = require('node:process')
+const Vite = require('vite')
+const Chalk = require('chalk')
+const Chokidar = require('chokidar')
+const Electron = require('electron')
+const compileTs = require('./private/tsc')
+
+process.env.NODE_ENV = 'development'
+
+let viteServer = null
+let electronProcess = null
+let electronProcessLocker = false
+let rendererPort = 0
+
+async function startRenderer() {
+  viteServer = await Vite.createServer({
+    configFile: Path.join(__dirname, '..', 'vite.config.ts'),
+    mode: 'development',
+  })
+
+  return viteServer.listen()
+}
+
+async function startElectron() {
+  if (electronProcess) { // single instance lock
+    return
+  }
+
+  try {
+    console.log('tsc命令', Path.join(__dirname, '..', 'electron'))
+    await compileTs(Path.join(__dirname, '..', 'electron'))
+  } catch (error) {
+    console.log(error)
+    console.log(Chalk.redBright('Could not start Electron because of the above typescript error(s).'))
+    electronProcessLocker = false
+    return
+  }
+
+  const args = [
+    Path.join(__dirname, '..', 'build', 'main', 'main.js'),
+    rendererPort,
+  ]
+  electronProcess = ChildProcess.spawn(Electron, args)
+  electronProcessLocker = false
+  console.log('111111')
+  electronProcess.stdout.on('data', data =>
+    process.stdout.write(Chalk.blueBright('[electron] ') + Chalk.white(data.toString())),
+  )
+
+  electronProcess.stderr.on('data', data =>
+    process.stderr.write(Chalk.blueBright('[electron] ') + Chalk.white(data.toString())),
+  )
+
+  electronProcess.on('exit', () => stop())
+}
+
+function restartElectron() {
+  if (electronProcess) {
+    electronProcess.removeAllListeners('exit')
+    electronProcess.kill()
+    electronProcess = null
+  }
+
+  if (!electronProcessLocker) {
+    electronProcessLocker = true
+    startElectron()
+  }
+}
+
+function copyStaticFiles() {
+  copy('static')
+}
+
+/*
+The working dir of Electron is build/main instead of src/main because of TS.
+tsc does not copy static files, so copy them over manually for dev server.
+*/
+function copy(path) {
+  FileSystem.cpSync(
+    Path.join(__dirname, '..', 'electron', path),
+    Path.join(__dirname, '..', 'build', 'main', path),
+    { recursive: true },
+  )
+}
+
+function stop() {
+  viteServer.close()
+  process.exit()
+}
+
+async function start() {
+  console.log(`${Chalk.greenBright('=======================================')}`)
+  console.log(`${Chalk.greenBright('Starting Electron + Vite Dev Server...')}`)
+  console.log(`${Chalk.greenBright('=======================================')}`)
+
+  const devServer = await startRenderer()
+  rendererPort = devServer.config.server.port
+
+  copyStaticFiles()
+  startElectron()
+
+  const path = Path.join(__dirname, '..', 'electron')
+  Chokidar.watch(path, {
+    cwd: path,
+  }).on('change', (path) => {
+    console.log(`${Chalk.blueBright('[electron] ')}Change in ${path}. reloading... 🚀`)
+
+    if (path.startsWith(Path.join('static', '/'))) {
+      copy(path)
+    }
+
+    restartElectron()
+  })
+}
+
+start()
